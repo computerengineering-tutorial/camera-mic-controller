@@ -1,0 +1,292 @@
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::process::{Child, Command, Stdio};
+
+pub const VIRTUAL_SINK_NAME: &str = "Rust_VirtualMicSink";
+pub const VIRTUAL_SOURCE_NAME: &str = "Rust_VirtualMic";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MicStatus {
+    pub exists: bool,
+    pub source_name: String,
+    pub sink_name: String,
+    pub is_muted: bool,
+    pub active: bool,
+}
+
+pub struct MicController;
+
+impl MicController {
+    /// Check if the virtual mic source currently exists in PulseAudio/PipeWire.
+    pub fn exists() -> bool {
+        let output = Command::new("pactl")
+            .args(["list", "sources", "short"])
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout.contains(VIRTUAL_SOURCE_NAME)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Ensure the virtual mic sink and source are created and registered.
+    pub fn ensure_virtual_mic() -> Result<()> {
+        if Self::exists() {
+            return Ok(());
+        }
+
+        // 1. Create Null-Sink
+        let sink_res = Command::new("pactl")
+            .args([
+                "load-module",
+                "module-null-sink",
+                &format!("sink_name={}", VIRTUAL_SINK_NAME),
+                "sink_properties=device.description=Rust_Virtual_Mic_Sink",
+            ])
+            .output()
+            .context("Failed to run pactl to create null sink")?;
+
+        if !sink_res.status.success() {
+            let err = String::from_utf8_lossy(&sink_res.stderr);
+            bail!("Failed to create null sink: {}", err);
+        }
+
+        // 2. Create Remap-Source so it appears as a microphone input
+        let source_res = Command::new("pactl")
+            .args([
+                "load-module",
+                "module-remap-source",
+                &format!("master={}.monitor", VIRTUAL_SINK_NAME),
+                &format!("source_name={}", VIRTUAL_SOURCE_NAME),
+                "source_properties=device.description=Rust_Virtual_Microphone",
+            ])
+            .output()
+            .context("Failed to run pactl to create remap source")?;
+
+        if !source_res.status.success() {
+            let err = String::from_utf8_lossy(&source_res.stderr);
+            bail!("Failed to create remap source: {}", err);
+        }
+
+        // Set as default system recording source so browsers & websites capture it automatically
+        let _ = Command::new("pactl")
+            .args(["set-default-source", VIRTUAL_SOURCE_NAME])
+            .output();
+
+        // Unmute initially & set volume to 100%
+        let _ = Self::set_mute(false);
+        let _ = Self::set_volume(100);
+
+        Ok(())
+    }
+
+    /// Turn Mic ON (unmute).
+    pub fn turn_on() -> Result<()> {
+        Self::ensure_virtual_mic()?;
+        Self::set_mute(false)
+    }
+
+    /// Turn Mic OFF (mute).
+    pub fn turn_off() -> Result<()> {
+        Self::ensure_virtual_mic()?;
+        Self::set_mute(true)
+    }
+
+    /// Set mute status (true = mute/off, false = unmute/on).
+    pub fn set_mute(muted: bool) -> Result<()> {
+        let flag = if muted { "1" } else { "0" };
+        let res = Command::new("pactl")
+            .args(["set-source-mute", VIRTUAL_SOURCE_NAME, flag])
+            .output()
+            .context("Failed to toggle source mute")?;
+
+        if !res.status.success() {
+            let err = String::from_utf8_lossy(&res.stderr);
+            bail!("Failed to set mute: {}", err);
+        }
+        Ok(())
+    }
+
+    /// Check if currently muted.
+    pub fn is_muted() -> Result<bool> {
+        let res = Command::new("pactl")
+            .args(["get-source-mute", VIRTUAL_SOURCE_NAME])
+            .output()
+            .context("Failed to get source mute state")?;
+
+        if !res.status.success() {
+            return Ok(false);
+        }
+
+        let out = String::from_utf8_lossy(&res.stdout);
+        Ok(out.to_lowercase().contains("yes"))
+    }
+
+    /// Set source volume percentage (e.g. 100, 80, 120).
+    pub fn set_volume(percent: u32) -> Result<()> {
+        let res = Command::new("pactl")
+            .args(["set-source-volume", VIRTUAL_SOURCE_NAME, &format!("{}%", percent)])
+            .output()
+            .context("Failed to set source volume")?;
+
+        if !res.status.success() {
+            let err = String::from_utf8_lossy(&res.stderr);
+            bail!("Failed to set volume: {}", err);
+        }
+        Ok(())
+    }
+
+    /// Adjust volume by delta percentage (e.g. +5 or -5).
+    pub fn adjust_volume(delta: i32) -> Result<()> {
+        let sign = if delta >= 0 { format!("+{}%", delta) } else { format!("{}%", delta) };
+        let res = Command::new("pactl")
+            .args(["set-source-volume", VIRTUAL_SOURCE_NAME, &sign])
+            .output()
+            .context("Failed to adjust source volume")?;
+
+        if !res.status.success() {
+            let err = String::from_utf8_lossy(&res.stderr);
+            bail!("Failed to adjust volume: {}", err);
+        }
+        Ok(())
+    }
+
+    /// Read current volume percentage.
+    #[allow(dead_code)]
+    pub fn get_volume() -> Result<u32> {
+        let res = Command::new("pactl")
+            .args(["get-source-volume", VIRTUAL_SOURCE_NAME])
+            .output()
+            .context("Failed to get source volume")?;
+
+        if !res.status.success() {
+            return Ok(100);
+        }
+
+        let out = String::from_utf8_lossy(&res.stdout);
+        // Look for pattern like "100%" or "80%"
+        for part in out.split_whitespace() {
+            if part.ends_with('%') {
+                if let Ok(val) = part.trim_end_matches('%').parse::<u32>() {
+                    return Ok(val);
+                }
+            }
+        }
+        Ok(100)
+    }
+
+    /// Get current status.
+    pub fn status() -> Result<MicStatus> {
+        let exists = Self::exists();
+        let is_muted = if exists {
+            Self::is_muted().unwrap_or(false)
+        } else {
+            false
+        };
+
+        Ok(MicStatus {
+            exists,
+            source_name: VIRTUAL_SOURCE_NAME.to_string(),
+            sink_name: VIRTUAL_SINK_NAME.to_string(),
+            is_muted,
+            active: exists && !is_muted,
+        })
+    }
+
+    /// Remove virtual mic modules from PulseAudio/PipeWire and restore default hardware mic.
+    pub fn teardown() -> Result<()> {
+        // Restore default hardware recording source first
+        if let Ok(output) = Command::new("pactl").args(["list", "sources", "short"]).output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && !parts[1].contains("Rust_Virtual") && !parts[1].contains("monitor") {
+                    let _ = Command::new("pactl").args(["set-default-source", parts[1]]).output();
+                    break;
+                }
+            }
+        }
+
+        let output = Command::new("pactl")
+            .args(["list", "modules", "short"])
+            .output()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains(VIRTUAL_SINK_NAME) || line.contains(VIRTUAL_SOURCE_NAME) {
+                if let Some(id) = line.split_whitespace().next() {
+                    let _ = Command::new("pactl")
+                        .args(["unload-module", id])
+                        .output();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn an ultra-low-latency pacat process feeding into Rust_VirtualMicSink.
+    pub fn open_audio_writer(
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<AudioPipeWriter> {
+        Self::ensure_virtual_mic()?;
+
+        let mut child = Command::new("pacat")
+            .args([
+                "--playback",
+                "-d",
+                VIRTUAL_SINK_NAME,
+                "--format=s16le",
+                &format!("--rate={}", sample_rate),
+                &format!("--channels={}", channels),
+                "--latency-msec=10",
+                "--raw",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn pacat audio playback process")?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .context("Failed to open stdin for pacat")?;
+
+        Ok(AudioPipeWriter { child, stdin })
+    }
+}
+
+pub struct AudioPipeWriter {
+    child: Child,
+    stdin: std::process::ChildStdin,
+}
+
+impl AudioPipeWriter {
+    pub fn open(sample_rate: u32, channels: u16) -> Result<Self> {
+        MicController::open_audio_writer(sample_rate, channels)
+    }
+
+    pub fn write_pcm(&mut self, chunk: &[u8]) -> Result<()> {
+        self.stdin
+            .write_all(chunk)
+            .context("Failed to write PCM chunk to audio pipe")?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.stdin.flush().context("Failed to flush audio pipe")?;
+        Ok(())
+    }
+}
+
+impl Drop for AudioPipeWriter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
