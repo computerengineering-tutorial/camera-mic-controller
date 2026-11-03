@@ -176,4 +176,3 @@ pub struct SyncFeedArgs {
     #[arg(long, default_value = "48000")]
     pub sample_rate: u32,
 }
-

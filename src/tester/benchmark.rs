@@ -1,7 +1,7 @@
 use anyhow::Result;
 use colored::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::device::camera::CameraWriter;
@@ -27,9 +27,20 @@ pub struct TestRunner;
 impl TestRunner {
     /// Execute end-to-end real-world tests and benchmarks.
     pub fn run_full_suite() -> Result<BenchmarkReport> {
-        println!("{}", "============================================================".bright_blue());
-        println!("{}", "   RUNNING REAL-WORLD CAMERA & MIC CONTROLLER TEST SUITE    ".bold().white());
-        println!("{}", "============================================================".bright_blue());
+        println!(
+            "{}",
+            "============================================================".bright_blue()
+        );
+        println!(
+            "{}",
+            "   RUNNING REAL-WORLD CAMERA & MIC CONTROLLER TEST SUITE    "
+                .bold()
+                .white()
+        );
+        println!(
+            "{}",
+            "============================================================".bright_blue()
+        );
 
         let mut report = BenchmarkReport::default();
 
@@ -50,11 +61,17 @@ impl TestRunner {
         assert!(!MicController::is_muted()?, "Mic should be unmuted");
         report.mic_toggle_latency_us = t_toggle.elapsed().as_micros() as f64 / 2.0;
 
-        println!("{} (Provision: {:.1}ms, Toggle: {:.0}µs)", "PASSED".green().bold(), report.mic_provision_ms, report.mic_toggle_latency_us);
+        println!(
+            "{} (Provision: {:.1}ms, Toggle: {:.0}µs / {:.2}ms)",
+            "PASSED".green().bold(),
+            report.mic_provision_ms,
+            report.mic_toggle_latency_us,
+            report.mic_toggle_latency_us / 1000.0
+        );
 
         // 2. Camera Writer & Blanking Test
         print!("  [2/4] Testing Virtual Camera writer & blanking logic... ");
-        let mut cam = CameraWriter::open(None, 640, 480)?;
+        let mut cam = CameraWriter::open(None, 640, 480, 30)?;
         let test_frame = vec![128u8; cam.frame_size()];
 
         let t_cam = Instant::now();
@@ -71,7 +88,11 @@ impl TestRunner {
         cam.turn_on();
         assert!(cam.is_camera_on(), "Camera should report ON state");
 
-        println!("{} (Write speed: {:.0} FPS equivalent)", "PASSED".green().bold(), report.camera_write_fps);
+        println!(
+            "{} (Write speed: {:.0} FPS equivalent)",
+            "PASSED".green().bold(),
+            report.camera_write_fps
+        );
 
         // 3. Audio Pipe Feeding Test
         print!("  [3/4] Testing low-latency PCM audio stream pipeline... ");
@@ -91,7 +112,8 @@ impl TestRunner {
         report.total_test_frames = test_frames;
 
         let chunk_samples = 960u64; // 20ms
-        let audio_chunk_bytes = (chunk_samples * DEFAULT_CHANNELS as u64 * BYTES_PER_SAMPLE as u64) as usize;
+        let audio_chunk_bytes =
+            (chunk_samples * DEFAULT_CHANNELS as u64 * BYTES_PER_SAMPLE as u64) as usize;
 
         let mut clock = MasterClock::new(sample_rate, fps);
         let mut drifts = Vec::new();
@@ -142,31 +164,183 @@ impl TestRunner {
 
         let sum: f64 = drifts.iter().sum();
         report.av_mean_drift_ms = sum / drifts.len() as f64;
-        report.av_max_drift_ms = *drifts.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&0.0);
+        report.av_max_drift_ms = *drifts
+            .iter()
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap_or(&0.0);
         report.dropped_frames = 0;
 
-        // Check if drift passed standard threshold (< 15ms)
-        let sync_passed = report.av_max_drift_ms < 35.0; // tight threshold
+        // Check if drift passed standard threshold (< 35ms)
+        let sync_passed = report.av_max_drift_ms < 35.0;
         if sync_passed {
-            println!("{} (Mean drift: {:.2}ms, Max drift: {:.2}ms)", "PASSED".green().bold(), report.av_mean_drift_ms, report.av_max_drift_ms);
+            println!(
+                "{} (Mean drift: {:.2}ms, Max drift: {:.2}ms)",
+                "PASSED".green().bold(),
+                report.av_mean_drift_ms,
+                report.av_max_drift_ms
+            );
         } else {
-            println!("{} (Max drift: {:.2}ms exceeded threshold)", "WARNING".yellow().bold(), report.av_max_drift_ms);
+            println!(
+                "{} (Max drift: {:.2}ms exceeded threshold)",
+                "WARNING".yellow().bold(),
+                report.av_max_drift_ms
+            );
         }
 
         report.passed = sync_passed;
 
-        println!("{}", "────────────────────────────────────────────────────────────".bright_blue());
-        println!("{}", "                REAL-WORLD TEST SUMMARY                     ".bold().white());
-        println!("{}", "────────────────────────────────────────────────────────────".bright_blue());
-        println!("  • Mic Provision Time:       {:.2} ms", report.mic_provision_ms);
-        println!("  • Mic State Toggle Latency: {:.1} µs (< 1 ms)", report.mic_toggle_latency_us);
-        println!("  • Camera Frame Throughput:  {:.1} FPS", report.camera_write_fps);
-        println!("  • A/V Sync Mean Drift:      {:.2} ms", report.av_mean_drift_ms);
-        println!("  • A/V Sync Peak Drift:      {:.2} ms", report.av_max_drift_ms);
-        println!("  • Dropped Frames:           {} / {}", report.dropped_frames, report.total_test_frames);
-        println!("  • Overall Status:           {}", if report.passed { "ALL TESTS PASSED".green().bold() } else { "PARTIAL PASS".yellow().bold() });
-        println!("{}", "============================================================".bright_blue());
+        println!(
+            "{}",
+            "────────────────────────────────────────────────────────────".bright_blue()
+        );
+        println!(
+            "{}",
+            "                REAL-WORLD TEST SUMMARY                     "
+                .bold()
+                .white()
+        );
+        println!(
+            "{}",
+            "────────────────────────────────────────────────────────────".bright_blue()
+        );
+        println!(
+            "  • Mic Provision Time:       {:.2} ms",
+            report.mic_provision_ms
+        );
+        println!(
+            "  • Mic State Toggle Latency: {:.1} µs ({:.2} ms)",
+            report.mic_toggle_latency_us,
+            report.mic_toggle_latency_us / 1000.0
+        );
+        println!(
+            "  • Camera Frame Throughput:  {:.1} FPS",
+            report.camera_write_fps
+        );
+        println!(
+            "  • A/V Sync Mean Drift:      {:.2} ms",
+            report.av_mean_drift_ms
+        );
+        println!(
+            "  • A/V Sync Peak Drift:      {:.2} ms",
+            report.av_max_drift_ms
+        );
+        println!(
+            "  • Dropped Frames:           {} / {}",
+            report.dropped_frames, report.total_test_frames
+        );
+        println!(
+            "  • Overall Status:           {}",
+            if report.passed {
+                "ALL TESTS PASSED".green().bold()
+            } else {
+                "PARTIAL PASS".yellow().bold()
+            }
+        );
+        println!(
+            "{}",
+            "============================================================".bright_blue()
+        );
 
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feeder::process::ManagedChild;
+    use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer};
+    use crossbeam_channel::unbounded;
+    use std::path::Path;
+
+    #[test]
+    fn test_managed_child_cleanup() {
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("Failed to spawn test sleep command");
+
+        let mut managed = ManagedChild::new(child);
+        assert!(managed.as_mut().is_some());
+
+        // Replace with new command, ensuring old one is killed
+        let new_child = std::process::Command::new("sleep")
+            .arg("0.1")
+            .spawn()
+            .expect("Failed to spawn second sleep command");
+
+        managed.replace(new_child);
+        managed.kill_and_wait();
+        assert!(managed.as_mut().is_none());
+    }
+
+    #[test]
+    fn test_ipc_server_client_roundtrip() {
+        let is_camera_on = Arc::new(AtomicBool::new(true));
+        let is_mic_on = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = unbounded();
+        let running = Arc::new(AtomicBool::new(true));
+
+        let _handle =
+            IpcServer::start(is_camera_on.clone(), is_mic_on.clone(), tx, running.clone())
+                .expect("IPC Server should start successfully");
+
+        // Small wait for listener to bind
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 1. GetStatus
+        let resp = IpcClient::send(&IpcRequest::GetStatus).expect("IPC send should succeed");
+        assert!(resp.success);
+        assert!(resp.active_stream);
+        assert_eq!(resp.camera_on, Some(true));
+        assert_eq!(resp.mic_on, Some(true));
+
+        // 2. SetCamera(false)
+        let resp_cam = IpcClient::send(&IpcRequest::SetCamera(false)).unwrap();
+        assert!(resp_cam.success);
+        assert_eq!(is_camera_on.load(Ordering::SeqCst), false);
+
+        // 3. SetCamera(true)
+        let _ = IpcClient::send(&IpcRequest::SetCamera(true)).unwrap();
+        assert_eq!(is_camera_on.load(Ordering::SeqCst), true);
+
+        running.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_device_detection_rejects_non_output_device() {
+        use crate::device::camera::CameraController;
+        // Rejects non-existent path
+        assert!(!CameraController::is_loopback_or_output_device(Path::new(
+            "/dev/video_non_existent_999"
+        )));
+        // Rejects /dev/null (not a v4l2 device)
+        assert!(!CameraController::is_loopback_or_output_device(Path::new(
+            "/dev/null"
+        )));
+    }
+
+    #[test]
+    fn test_ipc_serialization() {
+        let req = IpcRequest::SetCamera(true);
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            IpcRequest::SetCamera(b) => assert!(b),
+            _ => panic!("Expected SetCamera"),
+        }
+
+        let resp = IpcResponse {
+            success: true,
+            message: "OK".to_string(),
+            camera_on: Some(true),
+            mic_on: Some(false),
+            active_stream: true,
+        };
+        let json_resp = serde_json::to_string(&resp).unwrap();
+        let des_resp: IpcResponse = serde_json::from_str(&json_resp).unwrap();
+        assert!(des_resp.success);
+        assert_eq!(des_resp.camera_on, Some(true));
+        assert_eq!(des_resp.mic_on, Some(false));
     }
 }

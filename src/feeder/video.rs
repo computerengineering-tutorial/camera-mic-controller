@@ -4,17 +4,30 @@ use crossbeam_channel::unbounded;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::device::camera::CameraWriter;
-use crate::feeder::playlist::{spawn_hotkey_listener, StreamControl};
+use crate::feeder::playlist::{StreamControl, spawn_hotkey_listener};
+use crate::feeder::process::ManagedChild;
+use crate::ipc::IpcServer;
 use crate::sync::clock::MasterClock;
 
 pub const DEFAULT_WIDTH: u32 = 640;
 pub const DEFAULT_HEIGHT: u32 = 480;
 pub const DEFAULT_FPS: f64 = 30.0;
+
+#[derive(Debug, Clone)]
+pub struct VideoFeedConfig {
+    pub playlist: Vec<PathBuf>,
+    pub camera_target: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub initial_seek: Option<f64>,
+    pub initial_loop: bool,
+}
 
 pub struct VideoFeeder;
 
@@ -30,10 +43,8 @@ impl VideoFeeder {
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-v").arg("quiet");
 
-        if let Some(ss) = seek_seconds {
-            if ss > 0.0 {
-                cmd.arg("-ss").arg(format!("{:.3}", ss));
-            }
+        if let Some(ss) = seek_seconds.filter(|&s| s > 0.0) {
+            cmd.arg("-ss").arg(format!("{:.3}", ss));
         }
 
         cmd.args([
@@ -53,7 +64,9 @@ impl VideoFeeder {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-        let child = cmd.spawn().context("Failed to spawn ffmpeg video decoder")?;
+        let child = cmd
+            .spawn()
+            .context("Failed to spawn ffmpeg video decoder")?;
         Ok(child)
     }
 
@@ -97,94 +110,158 @@ impl VideoFeeder {
 
     /// Feed a playlist of video files into the virtual camera.
     pub fn feed_playlist(
-        playlist: Vec<PathBuf>,
-        camera_target: Option<&str>,
-        width: u32,
-        height: u32,
-        fps: u32,
-        initial_seek: Option<f64>,
-        initial_loop: bool,
+        config: VideoFeedConfig,
         is_camera_on: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
     ) -> Result<()> {
         let (ctrl_tx, ctrl_rx) = unbounded::<StreamControl>();
-        spawn_hotkey_listener(ctrl_tx);
+        spawn_hotkey_listener(ctrl_tx.clone());
 
-        let mut writer = CameraWriter::open(camera_target, width, height)?;
-        let frame_size = (width * height * 3 / 2) as usize;
+        // Start IPC server for remote CLI control
+        let is_mic_dummy = Arc::new(AtomicBool::new(false));
+        let _ipc_handle =
+            IpcServer::start(is_camera_on.clone(), is_mic_dummy, ctrl_tx, running.clone())?;
+
+        let mut writer = CameraWriter::open(
+            config.camera_target.as_deref(),
+            config.width,
+            config.height,
+            config.fps,
+        )?;
+        let frame_size = (config.width * config.height * 3 / 2) as usize;
         let mut buf = vec![0u8; frame_size];
 
         let mut track_idx = 0usize;
-        let mut loop_mode = initial_loop;
-        let mut seek_pos = initial_seek;
+        let mut loop_mode = config.initial_loop;
+        let mut seek_pos = config.initial_seek;
         let mut is_paused = false;
 
-        println!("{}", "══════════════════════════════════════════════════════════════".bright_cyan());
-        println!("{}", "           RUST VIRTUAL CAMERA STREAMING CONTROLLER           ".bold().white());
-        println!("{}", "══════════════════════════════════════════════════════════════".bright_cyan());
-        println!("  Controls: [n] Next | [p] Prev | [l] Loop | [f] +10s | [b] -10s | [space] Pause | [c] Cam | [q] Stop");
-        println!("{}", "──────────────────────────────────────────────────────────────".bright_cyan());
+        println!(
+            "{}",
+            "══════════════════════════════════════════════════════════════".bright_cyan()
+        );
+        println!(
+            "{}",
+            "           RUST VIRTUAL CAMERA STREAMING CONTROLLER           "
+                .bold()
+                .white()
+        );
+        println!(
+            "{}",
+            "══════════════════════════════════════════════════════════════".bright_cyan()
+        );
+        println!(
+            "  Controls: [n] Next | [p] Prev | [l] Loop | [f] +10s | [b] -10s | [space] Pause | [c] Cam | [q] Stop"
+        );
+        println!(
+            "{}",
+            "──────────────────────────────────────────────────────────────".bright_cyan()
+        );
 
-        while running.load(Ordering::Relaxed) && track_idx < playlist.len() {
-            let current_track = &playlist[track_idx];
+        while running.load(Ordering::Relaxed) && track_idx < config.playlist.len() {
+            let current_track = &config.playlist[track_idx];
             println!(
                 "  {} [{}/{}] {}",
                 "Playing:".bright_yellow(),
                 track_idx + 1,
-                playlist.len(),
+                config.playlist.len(),
                 current_track.display()
             );
 
-            let mut decoder = Self::spawn_decoder(current_track, width, height, fps, seek_pos)?;
-            let mut stdout = decoder.stdout.take().context("Failed to take video stdout")?;
+            let mut decoder = ManagedChild::new(Self::spawn_decoder(
+                current_track,
+                config.width,
+                config.height,
+                config.fps,
+                seek_pos,
+            )?);
+            let mut stdout = decoder
+                .as_mut()
+                .unwrap()
+                .stdout
+                .take()
+                .context("Failed to take video stdout")?;
             seek_pos = None;
 
-            let mut clock = MasterClock::new(48000, fps as f64);
+            let mut clock = MasterClock::new(48000, config.fps as f64);
             let mut current_sec = 0.0f64;
 
             while running.load(Ordering::Relaxed) {
                 while let Ok(ctrl) = ctrl_rx.try_recv() {
                     match ctrl {
                         StreamControl::Next => {
-                            if track_idx + 1 < playlist.len() {
+                            if track_idx + 1 < config.playlist.len() {
                                 track_idx += 1;
                             } else if loop_mode {
                                 track_idx = 0;
                             }
-                            let _ = decoder.kill();
-                            let _ = decoder.wait();
-                            stdout = match Self::spawn_decoder(&playlist[track_idx], width, height, fps, None) {
-                                Ok(mut ch) => ch.stdout.take().unwrap(),
+                            match Self::spawn_decoder(
+                                &config.playlist[track_idx],
+                                config.width,
+                                config.height,
+                                config.fps,
+                                None,
+                            ) {
+                                Ok(mut ch) => {
+                                    stdout = ch.stdout.take().unwrap();
+                                    decoder.replace(ch);
+                                }
                                 Err(_) => break,
-                            };
+                            }
                             clock.reset();
                             current_sec = 0.0;
-                            println!("\n  {} [{}/{}] {}", "Skipped to:".bright_yellow(), track_idx + 1, playlist.len(), playlist[track_idx].display());
+                            println!(
+                                "\n  {} [{}/{}] {}",
+                                "Skipped to:".bright_yellow(),
+                                track_idx + 1,
+                                config.playlist.len(),
+                                config.playlist[track_idx].display()
+                            );
                         }
                         StreamControl::Prev => {
                             if track_idx > 0 {
                                 track_idx -= 1;
                             } else {
-                                track_idx = playlist.len().saturating_sub(1);
+                                track_idx = config.playlist.len().saturating_sub(1);
                             }
-                            let _ = decoder.kill();
-                            let _ = decoder.wait();
-                            stdout = match Self::spawn_decoder(&playlist[track_idx], width, height, fps, None) {
-                                Ok(mut ch) => ch.stdout.take().unwrap(),
+                            match Self::spawn_decoder(
+                                &config.playlist[track_idx],
+                                config.width,
+                                config.height,
+                                config.fps,
+                                None,
+                            ) {
+                                Ok(mut ch) => {
+                                    stdout = ch.stdout.take().unwrap();
+                                    decoder.replace(ch);
+                                }
                                 Err(_) => break,
-                            };
+                            }
                             clock.reset();
                             current_sec = 0.0;
-                            println!("\n  {} [{}/{}] {}", "Previous track:".bright_yellow(), track_idx + 1, playlist.len(), playlist[track_idx].display());
+                            println!(
+                                "\n  {} [{}/{}] {}",
+                                "Previous track:".bright_yellow(),
+                                track_idx + 1,
+                                config.playlist.len(),
+                                config.playlist[track_idx].display()
+                            );
                         }
                         StreamControl::SeekDelta(delta) => {
                             let new_pos = (current_sec + delta).max(0.0);
-                            let _ = decoder.kill();
-                            let _ = decoder.wait();
-                            stdout = match Self::spawn_decoder(&playlist[track_idx], width, height, fps, Some(new_pos)) {
-                                Ok(mut ch) => ch.stdout.take().unwrap(),
+                            match Self::spawn_decoder(
+                                &config.playlist[track_idx],
+                                config.width,
+                                config.height,
+                                config.fps,
+                                Some(new_pos),
+                            ) {
+                                Ok(mut ch) => {
+                                    stdout = ch.stdout.take().unwrap();
+                                    decoder.replace(ch);
+                                }
                                 Err(_) => break,
-                            };
+                            }
                             current_sec = new_pos;
                             println!("\n  {} {:.1}s", "Seeked to:".bright_yellow(), new_pos);
                         }
@@ -193,7 +270,15 @@ impl VideoFeeder {
                         }
                         StreamControl::ToggleLoop => {
                             loop_mode = !loop_mode;
-                            println!("\n  {} {}", "Loop Mode:".bright_cyan(), if loop_mode { "ON".green().bold() } else { "OFF".red().bold() });
+                            println!(
+                                "\n  {} {}",
+                                "Loop Mode:".bright_cyan(),
+                                if loop_mode {
+                                    "ON".green().bold()
+                                } else {
+                                    "OFF".red().bold()
+                                }
+                            );
                         }
                         StreamControl::ToggleCamera => {
                             let cur = is_camera_on.load(Ordering::SeqCst);
@@ -219,10 +304,9 @@ impl VideoFeeder {
                         let v_pts = clock.advance_video();
                         current_sec = clock.video_pts_seconds();
 
-                        writer.is_on.store(
-                            is_camera_on.load(Ordering::Relaxed),
-                            Ordering::Relaxed,
-                        );
+                        writer
+                            .is_on
+                            .store(is_camera_on.load(Ordering::Relaxed), Ordering::Relaxed);
                         writer.write_frame(&buf)?;
 
                         clock.wait_until_pts(v_pts);
@@ -234,14 +318,13 @@ impl VideoFeeder {
                 }
             }
 
-            let _ = decoder.kill();
-            let _ = decoder.wait();
+            decoder.kill_and_wait();
 
             if !running.load(Ordering::Relaxed) {
                 break;
             }
 
-            if track_idx + 1 < playlist.len() {
+            if track_idx + 1 < config.playlist.len() {
                 track_idx += 1;
             } else if loop_mode {
                 track_idx = 0;
@@ -250,7 +333,24 @@ impl VideoFeeder {
             }
         }
 
+        crate::feeder::playlist::restore_terminal();
         println!("\n{}", "Video stream completed.".bright_green());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_synthetic_frame_size() {
+        let frame = VideoFeeder::generate_synthetic_frame(320, 240, 0, false);
+        // 320 * 240 * 1.5 = 115,200 bytes
+        assert_eq!(frame.len(), 115200);
+        // Neutral chroma at U & V offsets
+        let y_size = 320 * 240;
+        assert_eq!(frame[y_size], 128);
+        assert_eq!(frame[y_size + 1], 128);
     }
 }

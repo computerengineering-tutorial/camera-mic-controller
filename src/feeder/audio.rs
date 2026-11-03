@@ -4,12 +4,14 @@ use crossbeam_channel::unbounded;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::device::mic::{AudioPipeWriter, MicController};
-use crate::feeder::playlist::{spawn_hotkey_listener, StreamControl};
+use crate::feeder::playlist::{StreamControl, spawn_hotkey_listener};
+use crate::feeder::process::ManagedChild;
+use crate::ipc::IpcServer;
 use crate::sync::clock::MasterClock;
 
 pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
@@ -24,10 +26,8 @@ impl AudioFeeder {
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-v").arg("quiet");
 
-        if let Some(ss) = seek_seconds {
-            if ss > 0.0 {
-                cmd.arg("-ss").arg(format!("{:.3}", ss));
-            }
+        if let Some(ss) = seek_seconds.filter(|&s| s > 0.0) {
+            cmd.arg("-ss").arg(format!("{:.3}", ss));
         }
 
         cmd.args([
@@ -47,7 +47,9 @@ impl AudioFeeder {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-        let child = cmd.spawn().context("Failed to spawn ffmpeg audio decoder")?;
+        let child = cmd
+            .spawn()
+            .context("Failed to spawn ffmpeg audio decoder")?;
         Ok(child)
     }
 
@@ -56,12 +58,12 @@ impl AudioFeeder {
         if (volume_factor - 1.0).abs() < 0.01 {
             return;
         }
-        for chunk_slice in chunk.chunks_exact_mut(2) {
-            let sample = i16::from_le_bytes([chunk_slice[0], chunk_slice[1]]);
-            let scaled = (sample as f32 * volume_factor).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-            let bytes = scaled.to_le_bytes();
-            chunk_slice[0] = bytes[0];
-            chunk_slice[1] = bytes[1];
+        let (chunks, _) = chunk.as_chunks_mut::<2>();
+        for chunk_slice in chunks {
+            let sample = i16::from_le_bytes(*chunk_slice);
+            let scaled =
+                (sample as f32 * volume_factor).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            *chunk_slice = scaled.to_le_bytes();
         }
     }
 
@@ -75,7 +77,12 @@ impl AudioFeeder {
         running: Arc<AtomicBool>,
     ) -> Result<()> {
         let (ctrl_tx, ctrl_rx) = unbounded::<StreamControl>();
-        spawn_hotkey_listener(ctrl_tx);
+        spawn_hotkey_listener(ctrl_tx.clone());
+
+        // Start IPC Server for external CLI control
+        let is_camera_dummy = Arc::new(AtomicBool::new(false));
+        let _ipc_handle =
+            IpcServer::start(is_camera_dummy, is_mic_on.clone(), ctrl_tx, running.clone())?;
 
         let mut writer = AudioPipeWriter::open(DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS)?;
         let chunk_samples = 960usize; // 20ms at 48kHz
@@ -89,11 +96,27 @@ impl AudioFeeder {
         let mut seek_pos = initial_seek;
         let mut is_paused = false;
 
-        println!("{}", "══════════════════════════════════════════════════════════════".bright_cyan());
-        println!("{}", "         RUST VIRTUAL MICROPHONE STREAMING CONTROLLER         ".bold().white());
-        println!("{}", "══════════════════════════════════════════════════════════════".bright_cyan());
-        println!("  Controls: [n] Next | [p] Prev | [l] Loop | [+] Vol+ | [-] Vol- | [f] +10s | [b] -10s | [space] Pause | [m] Mic | [q] Stop");
-        println!("{}", "──────────────────────────────────────────────────────────────".bright_cyan());
+        println!(
+            "{}",
+            "══════════════════════════════════════════════════════════════".bright_cyan()
+        );
+        println!(
+            "{}",
+            "         RUST VIRTUAL MICROPHONE STREAMING CONTROLLER         "
+                .bold()
+                .white()
+        );
+        println!(
+            "{}",
+            "══════════════════════════════════════════════════════════════".bright_cyan()
+        );
+        println!(
+            "  Controls: [n] Next | [p] Prev | [l] Loop | [+] Vol+ | [-] Vol- | [f] +10s | [b] -10s | [space] Pause | [m] Mic | [q] Stop"
+        );
+        println!(
+            "{}",
+            "──────────────────────────────────────────────────────────────".bright_cyan()
+        );
 
         while running.load(Ordering::Relaxed) && track_idx < playlist.len() {
             let current_track = &playlist[track_idx];
@@ -105,8 +128,13 @@ impl AudioFeeder {
                 current_track.display()
             );
 
-            let mut decoder = Self::spawn_decoder(current_track, seek_pos)?;
-            let mut stdout = decoder.stdout.take().context("Failed to take audio stdout")?;
+            let mut decoder = ManagedChild::new(Self::spawn_decoder(current_track, seek_pos)?);
+            let mut stdout = decoder
+                .as_mut()
+                .unwrap()
+                .stdout
+                .take()
+                .context("Failed to take audio stdout")?;
             seek_pos = None; // Reset seek after consuming
 
             let mut clock = MasterClock::new(DEFAULT_SAMPLE_RATE, 30.0);
@@ -122,15 +150,22 @@ impl AudioFeeder {
                             } else if loop_mode {
                                 track_idx = 0;
                             }
-                            let _ = decoder.kill();
-                            let _ = decoder.wait();
-                            stdout = match Self::spawn_decoder(&playlist[track_idx], None) {
-                                Ok(mut ch) => ch.stdout.take().unwrap(),
+                            match Self::spawn_decoder(&playlist[track_idx], None) {
+                                Ok(mut ch) => {
+                                    stdout = ch.stdout.take().unwrap();
+                                    decoder.replace(ch); // Replaces & kills previous child process cleanly
+                                }
                                 Err(_) => break,
-                            };
+                            }
                             clock.reset();
                             current_sec = 0.0;
-                            println!("\n  {} [{}/{}] {}", "Skipped to:".bright_yellow(), track_idx + 1, playlist.len(), playlist[track_idx].display());
+                            println!(
+                                "\n  {} [{}/{}] {}",
+                                "Skipped to:".bright_yellow(),
+                                track_idx + 1,
+                                playlist.len(),
+                                playlist[track_idx].display()
+                            );
                         }
                         StreamControl::Prev => {
                             if track_idx > 0 {
@@ -138,24 +173,32 @@ impl AudioFeeder {
                             } else {
                                 track_idx = playlist.len().saturating_sub(1);
                             }
-                            let _ = decoder.kill();
-                            let _ = decoder.wait();
-                            stdout = match Self::spawn_decoder(&playlist[track_idx], None) {
-                                Ok(mut ch) => ch.stdout.take().unwrap(),
+                            match Self::spawn_decoder(&playlist[track_idx], None) {
+                                Ok(mut ch) => {
+                                    stdout = ch.stdout.take().unwrap();
+                                    decoder.replace(ch);
+                                }
                                 Err(_) => break,
-                            };
+                            }
                             clock.reset();
                             current_sec = 0.0;
-                            println!("\n  {} [{}/{}] {}", "Previous track:".bright_yellow(), track_idx + 1, playlist.len(), playlist[track_idx].display());
+                            println!(
+                                "\n  {} [{}/{}] {}",
+                                "Previous track:".bright_yellow(),
+                                track_idx + 1,
+                                playlist.len(),
+                                playlist[track_idx].display()
+                            );
                         }
                         StreamControl::SeekDelta(delta) => {
                             let new_pos = (current_sec + delta).max(0.0);
-                            let _ = decoder.kill();
-                            let _ = decoder.wait();
-                            stdout = match Self::spawn_decoder(&playlist[track_idx], Some(new_pos)) {
-                                Ok(mut ch) => ch.stdout.take().unwrap(),
+                            match Self::spawn_decoder(&playlist[track_idx], Some(new_pos)) {
+                                Ok(mut ch) => {
+                                    stdout = ch.stdout.take().unwrap();
+                                    decoder.replace(ch);
+                                }
                                 Err(_) => break,
-                            };
+                            }
                             current_sec = new_pos;
                             println!("\n  {} {:.1}s", "Seeked to:".bright_yellow(), new_pos);
                         }
@@ -164,12 +207,23 @@ impl AudioFeeder {
                         }
                         StreamControl::ToggleLoop => {
                             loop_mode = !loop_mode;
-                            println!("\n  {} {}", "Loop Mode:".bright_cyan(), if loop_mode { "ON".green().bold() } else { "OFF".red().bold() });
+                            println!(
+                                "\n  {} {}",
+                                "Loop Mode:".bright_cyan(),
+                                if loop_mode {
+                                    "ON".green().bold()
+                                } else {
+                                    "OFF".red().bold()
+                                }
+                            );
                         }
                         StreamControl::VolumeDelta(d) => {
                             volume_factor = (volume_factor + (d as f32 / 100.0)).clamp(0.0, 3.0);
-                            let _ = MicController::adjust_volume(d);
-                            println!("\n  {} {:.0}%", "Volume:".bright_cyan(), volume_factor * 100.0);
+                            println!(
+                                "\n  {} {:.0}%",
+                                "Volume:".bright_cyan(),
+                                volume_factor * 100.0
+                            );
                         }
                         StreamControl::ToggleMic => {
                             let cur = is_mic_on.load(Ordering::SeqCst);
@@ -211,8 +265,7 @@ impl AudioFeeder {
                 }
             }
 
-            let _ = decoder.kill();
-            let _ = decoder.wait();
+            decoder.kill_and_wait();
 
             if !running.load(Ordering::Relaxed) {
                 break;
@@ -228,7 +281,32 @@ impl AudioFeeder {
             }
         }
 
+        crate::feeder::playlist::restore_terminal();
         println!("\n{}", "Audio stream completed.".bright_green());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_volume_scaling_clamp() {
+        // Test 100% volume (identity)
+        let mut chunk = vec![0x00, 0x10, 0x00, 0x20];
+        let original = chunk.clone();
+        AudioFeeder::apply_software_volume(&mut chunk, 1.0);
+        assert_eq!(chunk, original);
+
+        // Test 0% volume (silence)
+        AudioFeeder::apply_software_volume(&mut chunk, 0.0);
+        assert_eq!(chunk, vec![0, 0, 0, 0]);
+
+        // Test volume amplification and clipping
+        let mut max_chunk = i16::MAX.to_le_bytes().to_vec();
+        AudioFeeder::apply_software_volume(&mut max_chunk, 2.0);
+        let sample = i16::from_le_bytes([max_chunk[0], max_chunk[1]]);
+        assert_eq!(sample, i16::MAX);
     }
 }

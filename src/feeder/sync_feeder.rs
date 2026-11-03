@@ -3,15 +3,16 @@ use colored::*;
 use crossbeam_channel::unbounded;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::device::camera::CameraWriter;
 use crate::device::mic::{AudioPipeWriter, MicController};
 use crate::feeder::audio::{AudioFeeder, BYTES_PER_SAMPLE, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE};
-use crate::feeder::playlist::{spawn_hotkey_listener, StreamControl};
-use crate::feeder::video::{VideoFeeder, DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use crate::feeder::playlist::{StreamControl, spawn_hotkey_listener};
+use crate::feeder::video::{DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH, VideoFeeder};
+use crate::ipc::IpcServer;
 use crate::sync::clock::MasterClock;
 
 #[derive(Debug, Clone)]
@@ -57,35 +58,87 @@ impl SyncFeeder {
             anyhow::bail!("Playlist contains no media files to stream.");
         }
 
-        println!("{}", "══════════════════════════════════════════════════════════════".bright_cyan());
-        println!("{}", "   RUST A/V SYNCHRONIZED STREAMING CONTROLLER (LOW LATENCY)   ".bold().white());
-        println!("{}", "══════════════════════════════════════════════════════════════".bright_cyan());
-        println!("  {} {} files queued", "Playlist:".bright_yellow(), config.media_files.len());
-        println!("  {} {}x{} @ {} fps", "Video Stream:".bright_yellow(), config.width, config.height, config.fps);
-        println!("  {} {} Hz, 2ch s16le", "Audio Stream:".bright_yellow(), config.sample_rate);
-        println!("  {} {}", "Loop Mode:".bright_yellow(), if config.loop_mode { "ON".green().bold() } else { "OFF".red().bold() });
-        println!("{}", "──────────────────────────────────────────────────────────────".bright_cyan());
+        println!(
+            "{}",
+            "══════════════════════════════════════════════════════════════".bright_cyan()
+        );
+        println!(
+            "{}",
+            "   RUST A/V SYNCHRONIZED STREAMING CONTROLLER (LOW LATENCY)   "
+                .bold()
+                .white()
+        );
+        println!(
+            "{}",
+            "══════════════════════════════════════════════════════════════".bright_cyan()
+        );
+        println!(
+            "  {} {} files queued",
+            "Playlist:".bright_yellow(),
+            config.media_files.len()
+        );
+        println!(
+            "  {} {}x{} @ {} fps",
+            "Video Stream:".bright_yellow(),
+            config.width,
+            config.height,
+            config.fps
+        );
+        println!(
+            "  {} {} Hz, 2ch s16le",
+            "Audio Stream:".bright_yellow(),
+            config.sample_rate
+        );
+        println!(
+            "  {} {}",
+            "Loop Mode:".bright_yellow(),
+            if config.loop_mode {
+                "ON".green().bold()
+            } else {
+                "OFF".red().bold()
+            }
+        );
+        println!(
+            "{}",
+            "──────────────────────────────────────────────────────────────".bright_cyan()
+        );
         println!("  Controls: [n] Next | [p] Prev | [l] Loop | [+] Vol+ | [-] Vol-");
         println!("            [f] +10s | [b] -10s | [space] Pause | [c] Cam | [m] Mic | [q] Quit");
-        println!("{}", "──────────────────────────────────────────────────────────────".bright_cyan());
+        println!(
+            "{}",
+            "──────────────────────────────────────────────────────────────".bright_cyan()
+        );
 
         // Initialize Virtual Camera and Mic writers once
         let mut cam_writer = CameraWriter::open(
             config.camera_target.as_deref(),
             config.width,
             config.height,
+            config.fps,
         )?;
-        println!("  {} {}", "Virtual Camera:".green(), cam_writer.device_name());
+        println!(
+            "  {} {}",
+            "Virtual Camera:".green(),
+            cam_writer.device_name()
+        );
 
-        let mut audio_writer = AudioPipeWriter::open(
-            config.sample_rate,
-            DEFAULT_CHANNELS,
-        )?;
-        println!("  {} {}", "Virtual Mic:".green(), "Rust_VirtualMic (Active)");
-        println!("{}", "──────────────────────────────────────────────────────────────".bright_cyan());
+        let mut audio_writer = AudioPipeWriter::open(config.sample_rate, DEFAULT_CHANNELS)?;
+        println!("  {} Rust_VirtualMic (Active)", "Virtual Mic:".green());
+        println!(
+            "{}",
+            "──────────────────────────────────────────────────────────────".bright_cyan()
+        );
 
         let (ctrl_tx, ctrl_rx) = unbounded::<StreamControl>();
-        spawn_hotkey_listener(ctrl_tx);
+        spawn_hotkey_listener(ctrl_tx.clone());
+
+        // Start IPC Server for external CLI control (cam-mic camera off/on, mic off/on)
+        let _ipc_handle = IpcServer::start(
+            is_camera_on.clone(),
+            is_mic_on.clone(),
+            ctrl_tx,
+            running.clone(),
+        )?;
 
         let chunk_samples = 960usize; // 20ms audio slice
         let audio_chunk_bytes = chunk_samples * DEFAULT_CHANNELS as usize * BYTES_PER_SAMPLE;
@@ -125,18 +178,21 @@ impl SyncFeeder {
                 .take()
                 .context("Failed to take video decoder stdout")?;
 
-            let mut a_child = AudioFeeder::spawn_decoder(current_media, seek_pos)?;
-            let mut a_stdout = a_child
+            let mut a_child_raw = AudioFeeder::spawn_decoder(current_media, seek_pos)?;
+            let mut a_stdout = a_child_raw
                 .stdout
                 .take()
                 .context("Failed to take audio decoder stdout")?;
 
+            let a_child_shared = Arc::new(std::sync::Mutex::new(Some(a_child_raw)));
+            let a_child_for_thread = a_child_shared.clone();
+
             let current_start_sec = seek_pos.unwrap_or(0.0);
             seek_pos = None; // Reset seek after consuming
 
-            // Synchronizer clocks & thread communication
-            let audio_pts_ns = Arc::new(AtomicU64::new((current_start_sec * 1_000_000_000.0) as u64));
-            let video_pts_ns = Arc::new(AtomicU64::new((current_start_sec * 1_000_000_000.0) as u64));
+            // Synchronizer clocks & thread communication (both start from 0 for the decoder streams)
+            let audio_pts_ns = Arc::new(AtomicU64::new(0));
+            let video_pts_ns = Arc::new(AtomicU64::new(0));
 
             let track_running = Arc::new(AtomicBool::new(true));
             let a_running = track_running.clone();
@@ -178,7 +234,8 @@ impl SyncFeeder {
 
                                 if let Ok(mut w) = a_writer_clone.lock() {
                                     if a_mic_on.load(Ordering::Relaxed) {
-                                        let v_factor = a_vol_clone.load(Ordering::Relaxed) as f32 / 1000.0;
+                                        let v_factor =
+                                            a_vol_clone.load(Ordering::Relaxed) as f32 / 1000.0;
                                         AudioFeeder::apply_software_volume(&mut a_buf, v_factor);
                                         w.write_pcm(&a_buf)?;
                                     } else {
@@ -194,8 +251,13 @@ impl SyncFeeder {
                             Err(e) => return Err(e.into()),
                         }
                     }
-                    let _ = a_child.kill();
-                    let _ = a_child.wait();
+
+                    if let Ok(mut lock) = a_child_for_thread.lock()
+                        && let Some(mut ch) = lock.take()
+                    {
+                        let _ = ch.kill();
+                        let _ = ch.wait();
+                    }
                     Ok(())
                 })?;
 
@@ -239,17 +301,37 @@ impl SyncFeeder {
                         StreamControl::TogglePause => {
                             is_paused = !is_paused;
                             a_paused_flag.store(is_paused, Ordering::SeqCst);
-                            println!("\n  {} {}", "Playback:".bright_cyan(), if is_paused { "PAUSED".yellow().bold() } else { "RESUMED".green().bold() });
+                            println!(
+                                "\n  {} {}",
+                                "Playback:".bright_cyan(),
+                                if is_paused {
+                                    "PAUSED".yellow().bold()
+                                } else {
+                                    "RESUMED".green().bold()
+                                }
+                            );
                         }
                         StreamControl::ToggleLoop => {
                             loop_mode = !loop_mode;
-                            println!("\n  {} {}", "Loop Mode:".bright_cyan(), if loop_mode { "ON".green().bold() } else { "OFF".red().bold() });
+                            println!(
+                                "\n  {} {}",
+                                "Loop Mode:".bright_cyan(),
+                                if loop_mode {
+                                    "ON".green().bold()
+                                } else {
+                                    "OFF".red().bold()
+                                }
+                            );
                         }
                         StreamControl::VolumeDelta(d) => {
                             volume_factor = (volume_factor + (d as f32 / 100.0)).clamp(0.0, 3.0);
-                            a_volume_factor.store((volume_factor * 1000.0) as u32, Ordering::SeqCst);
-                            let _ = MicController::adjust_volume(d);
-                            println!("\n  {} {:.0}%", "Volume:".bright_cyan(), volume_factor * 100.0);
+                            a_volume_factor
+                                .store((volume_factor * 1000.0) as u32, Ordering::SeqCst);
+                            println!(
+                                "\n  {} {:.0}%",
+                                "Volume:".bright_cyan(),
+                                volume_factor * 100.0
+                            );
                         }
                         StreamControl::ToggleCamera => {
                             let cur = is_camera_on.load(Ordering::SeqCst);
@@ -287,7 +369,8 @@ impl SyncFeeder {
                         current_video_sec = current_start_sec + target_v_pts.as_secs_f64();
 
                         // Measure drift against concurrent audio thread
-                        let a_pts_duration = Duration::from_nanos(audio_pts_ns.load(Ordering::Relaxed));
+                        let a_pts_duration =
+                            Duration::from_nanos(audio_pts_ns.load(Ordering::Relaxed));
                         let a_sec = a_pts_duration.as_secs_f64();
                         let v_sec = target_v_pts.as_secs_f64();
                         let drift_ms = (v_sec - a_sec) * 1000.0;
@@ -299,10 +382,9 @@ impl SyncFeeder {
 
                         clock.wait_until_pts(target_v_pts);
 
-                        cam_writer.is_on.store(
-                            is_camera_on.load(Ordering::Relaxed),
-                            Ordering::Relaxed,
-                        );
+                        cam_writer
+                            .is_on
+                            .store(is_camera_on.load(Ordering::Relaxed), Ordering::Relaxed);
                         cam_writer.write_frame(&v_buf)?;
 
                         // Status update
@@ -319,7 +401,11 @@ impl SyncFeeder {
                                 "[MIC: OFF]".red().bold()
                             };
 
-                            let loop_badge = if loop_mode { "[LOOP]".cyan() } else { "".normal() };
+                            let loop_badge = if loop_mode {
+                                "[LOOP]".cyan()
+                            } else {
+                                "".normal()
+                            };
                             let drift_str = if drift_ms.abs() < 10.0 {
                                 format!("{:+.1} ms", drift_ms).green()
                             } else {
@@ -353,18 +439,23 @@ impl SyncFeeder {
                 }
             }
 
-            // Cleanup track processes
+            // Cleanup track processes cleanly: kill video child and audio child directly
             track_running.store(false, Ordering::SeqCst);
             let _ = v_child.kill();
             let _ = v_child.wait();
+
+            if let Ok(mut lock) = a_child_shared.lock()
+                && let Some(mut ch) = lock.take()
+            {
+                let _ = ch.kill();
+                let _ = ch.wait();
+            }
             let _ = audio_handle.join();
 
             // Reclaim audio_writer from Arc Mutex
             audio_writer = match Arc::try_unwrap(a_writer_mutex) {
                 Ok(mutex) => mutex.into_inner().unwrap(),
-                Err(_) => {
-                    AudioPipeWriter::open(config.sample_rate, DEFAULT_CHANNELS)?
-                }
+                Err(_) => AudioPipeWriter::open(config.sample_rate, DEFAULT_CHANNELS)?,
             };
 
             if !running.load(Ordering::Relaxed) {
@@ -387,7 +478,11 @@ impl SyncFeeder {
         }
 
         running.store(false, Ordering::SeqCst);
-        println!("\n{}", "A/V streaming session ended cleanly.".bright_green());
+        crate::feeder::playlist::restore_terminal();
+        println!(
+            "\n{}",
+            "A/V streaming session ended cleanly.".bright_green()
+        );
         Ok(())
     }
 }

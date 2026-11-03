@@ -1,10 +1,12 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 pub const VIRTUAL_SINK_NAME: &str = "Rust_VirtualMicSink";
 pub const VIRTUAL_SOURCE_NAME: &str = "Rust_VirtualMic";
+pub const SAVED_DEFAULT_SOURCE_PATH: &str = "/tmp/cam_mic_original_source.txt";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MicStatus {
@@ -33,10 +35,32 @@ impl MicController {
         }
     }
 
+    /// Read the currently configured default audio source from pactl.
+    pub fn get_default_source() -> Option<String> {
+        let res = Command::new("pactl")
+            .args(["get-default-source"])
+            .output()
+            .ok()?;
+        if res.status.success() {
+            let src = String::from_utf8_lossy(&res.stdout).trim().to_string();
+            if !src.is_empty() && !src.contains(VIRTUAL_SOURCE_NAME) {
+                return Some(src);
+            }
+        }
+        None
+    }
+
     /// Ensure the virtual mic sink and source are created and registered.
     pub fn ensure_virtual_mic() -> Result<()> {
         if Self::exists() {
             return Ok(());
+        }
+
+        // Save original default source if not already saved, so teardown can restore it
+        if !Path::new(SAVED_DEFAULT_SOURCE_PATH).exists()
+            && let Some(orig) = Self::get_default_source()
+        {
+            let _ = std::fs::write(SAVED_DEFAULT_SOURCE_PATH, orig);
         }
 
         // 1. Create Null-Sink
@@ -129,7 +153,11 @@ impl MicController {
     /// Set source volume percentage (e.g. 100, 80, 120).
     pub fn set_volume(percent: u32) -> Result<()> {
         let res = Command::new("pactl")
-            .args(["set-source-volume", VIRTUAL_SOURCE_NAME, &format!("{}%", percent)])
+            .args([
+                "set-source-volume",
+                VIRTUAL_SOURCE_NAME,
+                &format!("{}%", percent),
+            ])
             .output()
             .context("Failed to set source volume")?;
 
@@ -141,8 +169,13 @@ impl MicController {
     }
 
     /// Adjust volume by delta percentage (e.g. +5 or -5).
+    #[allow(dead_code)]
     pub fn adjust_volume(delta: i32) -> Result<()> {
-        let sign = if delta >= 0 { format!("+{}%", delta) } else { format!("{}%", delta) };
+        let sign = if delta >= 0 {
+            format!("+{}%", delta)
+        } else {
+            format!("{}%", delta)
+        };
         let res = Command::new("pactl")
             .args(["set-source-volume", VIRTUAL_SOURCE_NAME, &sign])
             .output()
@@ -168,12 +201,9 @@ impl MicController {
         }
 
         let out = String::from_utf8_lossy(&res.stdout);
-        // Look for pattern like "100%" or "80%"
         for part in out.split_whitespace() {
-            if part.ends_with('%') {
-                if let Ok(val) = part.trim_end_matches('%').parse::<u32>() {
-                    return Ok(val);
-                }
+            if let Some(val) = part.strip_suffix('%').and_then(|s| s.parse::<u32>().ok()) {
+                return Ok(val);
             }
         }
         Ok(100)
@@ -199,13 +229,39 @@ impl MicController {
 
     /// Remove virtual mic modules from PulseAudio/PipeWire and restore default hardware mic.
     pub fn teardown() -> Result<()> {
-        // Restore default hardware recording source first
-        if let Ok(output) = Command::new("pactl").args(["list", "sources", "short"]).output() {
+        // Restore saved original default recording source first
+        let mut restored = false;
+        if let Ok(orig) = std::fs::read_to_string(SAVED_DEFAULT_SOURCE_PATH) {
+            let orig_trimmed = orig.trim();
+            if !orig_trimmed.is_empty() {
+                let res = Command::new("pactl")
+                    .args(["set-default-source", orig_trimmed])
+                    .output();
+                if let Ok(out) = res
+                    && out.status.success()
+                {
+                    restored = true;
+                }
+            }
+            let _ = std::fs::remove_file(SAVED_DEFAULT_SOURCE_PATH);
+        }
+
+        // Fallback: search for first non-virtual, non-monitor source if original was not restored
+        if !restored
+            && let Ok(output) = Command::new("pactl")
+                .args(["list", "sources", "short"])
+                .output()
+        {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 && !parts[1].contains("Rust_Virtual") && !parts[1].contains("monitor") {
-                    let _ = Command::new("pactl").args(["set-default-source", parts[1]]).output();
+                if parts.len() >= 2
+                    && !parts[1].contains("Rust_Virtual")
+                    && !parts[1].contains("monitor")
+                {
+                    let _ = Command::new("pactl")
+                        .args(["set-default-source", parts[1]])
+                        .output();
                     break;
                 }
             }
@@ -216,23 +272,19 @@ impl MicController {
             .output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if line.contains(VIRTUAL_SINK_NAME) || line.contains(VIRTUAL_SOURCE_NAME) {
-                if let Some(id) = line.split_whitespace().next() {
-                    let _ = Command::new("pactl")
-                        .args(["unload-module", id])
-                        .output();
-                }
+        for line in stdout
+            .lines()
+            .filter(|l| l.contains(VIRTUAL_SINK_NAME) || l.contains(VIRTUAL_SOURCE_NAME))
+        {
+            if let Some(id) = line.split_whitespace().next() {
+                let _ = Command::new("pactl").args(["unload-module", id]).output();
             }
         }
         Ok(())
     }
 
     /// Spawn an ultra-low-latency pacat process feeding into Rust_VirtualMicSink.
-    pub fn open_audio_writer(
-        sample_rate: u32,
-        channels: u16,
-    ) -> Result<AudioPipeWriter> {
+    pub fn open_audio_writer(sample_rate: u32, channels: u16) -> Result<AudioPipeWriter> {
         Self::ensure_virtual_mic()?;
 
         let mut child = Command::new("pacat")
@@ -248,7 +300,7 @@ impl MicController {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null()) // Null stderr to prevent pipe buffer lockup deadlock
             .spawn()
             .context("Failed to spawn pacat audio playback process")?;
 
@@ -288,5 +340,31 @@ impl Drop for AudioPipeWriter {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_volume_string_parsing() {
+        let pactl_sample =
+            "Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB";
+        let mut parsed = None;
+        for part in pactl_sample.split_whitespace() {
+            if let Some(val) = part.strip_suffix('%').and_then(|s| s.parse::<u32>().ok()) {
+                parsed = Some(val);
+                break;
+            }
+        }
+        assert_eq!(parsed, Some(100));
+    }
+
+    #[test]
+    fn test_status_fields() {
+        let status = MicController::status().unwrap();
+        assert_eq!(status.source_name, VIRTUAL_SOURCE_NAME);
+        assert_eq!(status.sink_name, VIRTUAL_SINK_NAME);
     }
 }
